@@ -3,6 +3,7 @@ package raft
 import (
 	"github.com/SaswatPadhi/cluster"
 
+	"encoding/gob"
 	"encoding/json"
 	"io/ioutil"
 
@@ -27,20 +28,22 @@ const (
 	CANDIDATE = iota
 	FOLLOWER
 	LEADER
+
+	ERROR
 	STOPPED
 )
 
 // Raft Commands
 const (
-	APPEND_ENTRIES = "Me hu leader."
-	PEER_VOTED     = "Ye lo mera vote."
-	REQUEST_VOTE   = "Please vote karo!"
-	TERMINATE      = "Avada kedavra"
+	APPEND_ENTRIES = '0'
+	PEER_VOTED     = '1'
+	REQUEST_VOTE   = '2'
+	TERMINATE      = '3'
 )
 
 type request struct {
 	Addr    int
-	Command string
+	Command byte
 	Term    int64
 }
 
@@ -81,9 +84,13 @@ type replicator struct {
 	voted_for          int
 }
 
+func init() {
+	gob.Register(request{})
+}
+
 func NewReplicator(id int, config_file string) (r *replicator, err error) {
-	DBG_INFO.Println(fmt.Sprintf("Creating replicator [id: %d, config: %s]", id, config_file))
-	defer DBG_INFO.Println(fmt.Sprintf("Replicator creation returns [err: %s]", err))
+	INFO.Println(fmt.Sprintf("Creating replicator [id: %d, config: %s]", id, config_file))
+	defer INFO.Println(fmt.Sprintf("Replicator creation returns [err: %s]", err))
 
 	r = &replicator{
 		election_timeout:   UNINITIALIZED,
@@ -92,7 +99,7 @@ func NewReplicator(id int, config_file string) (r *replicator, err error) {
 		leader:             UNINITIALIZED,
 		outbox:             make(chan *request, 32),
 		server:             nil,
-		state:              STOPPED,
+		state:              ERROR,
 		stop:               make(chan bool, 2),
 		stopped:            make(chan bool),
 		stop_heartbeat:     make(chan bool),
@@ -118,6 +125,7 @@ func NewReplicator(id int, config_file string) (r *replicator, err error) {
 		return
 	}
 	r.server = s
+	r.state = STOPPED
 
 	return
 }
@@ -135,12 +143,14 @@ func (r *replicator) IsLeader() bool {
 }
 
 func (r *replicator) IsRunning() bool {
-	return r.state != STOPPED
+	return r.state != STOPPED && r.state != ERROR
 }
 
 func (r *replicator) Start() {
 	if r.state == STOPPED {
 		r.state = FOLLOWER
+		r.server.Start()
+
 		go r.monitorInbox()
 		go r.monitorOutbox()
 		go r.serve()
@@ -152,15 +162,19 @@ func (r *replicator) State() int8 {
 }
 
 func (r *replicator) Stop() {
-	DBG_INFO.Println(fmt.Sprintf("Stopping replicator %d", r.server.Pid()))
-	defer DBG_INFO.Println(fmt.Sprintf("Replicator %d has fully stopped", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Stopping replicator %d", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Replicator %d has fully stopped", r.server.Pid()))
 
-	r.server.Stop()
-	if r.state != STOPPED {
+	if r.state != STOPPED && r.state != ERROR {
 
+		// Stop the monitorinbox and monitoroutbox
 		r.stop <- true
 		r.stop <- true
 
+		// Stop the underlying cluster server
+		r.server.Stop()
+
+		// Issue a TERMINATE command to be picked up by current serve routine
 		r.inbox <- &request{
 			Addr:    r.server.Pid(),
 			Command: TERMINATE,
@@ -176,15 +190,14 @@ func (r *replicator) Term() int64 {
 }
 
 func (r *replicator) monitorInbox() {
-	DBG_INFO.Println(fmt.Sprintf("Inbox monitor for replicator %d started", r.server.Pid()))
-	defer DBG_INFO.Println(fmt.Sprintf("Inbox monitor for replicator %d stopped", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Inbox monitor for replicator %d started", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Inbox monitor for replicator %d stopped", r.server.Pid()))
 
 	for {
 		select {
 		case env := <-r.server.Inbox():
-			var new_req request
-			json.Unmarshal(env.Msg.([]byte), &new_req)
-			DBG_INFO.Println(fmt.Sprintf(" Replic %d <- %s", r.server.Pid(), new_req.toString()))
+			new_req := env.Msg.(request)
+			INFO.Println(fmt.Sprintf(" Replic %d <- %s", r.server.Pid(), new_req.toString()))
 			r.inbox <- &new_req
 		case <-r.stop:
 			return
@@ -193,20 +206,19 @@ func (r *replicator) monitorInbox() {
 }
 
 func (r *replicator) monitorOutbox() {
-	DBG_INFO.Println(fmt.Sprintf("Outbox monitor for replicator %d started", r.server.Pid()))
-	defer DBG_INFO.Println(fmt.Sprintf("Outbox monitor for replicator %d stopped", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Outbox monitor for replicator %d started", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Outbox monitor for replicator %d stopped", r.server.Pid()))
 
 	for {
 		select {
 		case req := <-r.outbox:
-			DBG_INFO.Println(fmt.Sprintf(" Replic %d -> %s", r.server.Pid(), req.toString()))
+			INFO.Println(fmt.Sprintf(" Replic %d -> %s", r.server.Pid(), req.toString()))
 			target := req.Addr
 			req.Addr = r.server.Pid()
-			serialized_req, _ := json.Marshal(req)
 			env := &cluster.Envelope{
 				Pid:   target,
 				MsgId: UNINITIALIZED,
-				Msg:   serialized_req,
+				Msg:   req,
 			}
 			r.server.Outbox() <- env
 		case <-r.stop:
@@ -216,8 +228,8 @@ func (r *replicator) monitorOutbox() {
 }
 
 func (r *replicator) serve() {
-	DBG_INFO.Println(fmt.Sprintf("Serve routine for replicator %d started", r.server.Pid()))
-	defer DBG_INFO.Println(fmt.Sprintf("Serve routine for replicator %d stopped", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Serve routine for replicator %d started", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Serve routine for replicator %d stopped", r.server.Pid()))
 
 	for {
 		switch r.state {
@@ -235,8 +247,8 @@ func (r *replicator) serve() {
 }
 
 func (r *replicator) serveAsCandidate() {
-	DBG_INFO.Println(fmt.Sprintf("Replicator %d is now serving as CANDIDATE", r.server.Pid()))
-	defer DBG_INFO.Println(fmt.Sprintf("Replicator %d is no more a CANDIDATE", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Replicator %d is now serving as CANDIDATE", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Replicator %d is no more a CANDIDATE", r.server.Pid()))
 
 	r.state = CANDIDATE
 	r.leader = UNINITIALIZED
@@ -284,8 +296,8 @@ func (r *replicator) serveAsCandidate() {
 }
 
 func (r *replicator) serveAsFollower() {
-	DBG_INFO.Println(fmt.Sprintf("Replicator %d is now serving as FOLLOWER", r.server.Pid()))
-	defer DBG_INFO.Println(fmt.Sprintf("Replicator %d is no more a FOLLOWER", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Replicator %d is now serving as FOLLOWER", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Replicator %d is no more a FOLLOWER", r.server.Pid()))
 
 	r.state = FOLLOWER
 
@@ -313,8 +325,8 @@ func (r *replicator) serveAsFollower() {
 }
 
 func (r *replicator) serveAsLeader() {
-	DBG_INFO.Println(fmt.Sprintf("Replicator %d is now serving as LEADER", r.server.Pid()))
-	defer DBG_INFO.Println(fmt.Sprintf("Replicator %d is no more a LEADER", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Replicator %d is now serving as LEADER", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Replicator %d is no more a LEADER", r.server.Pid()))
 
 	r.state = LEADER
 	r.leader = r.server.Pid()
@@ -329,15 +341,22 @@ func (r *replicator) serveAsLeader() {
 			} else if req.Command == APPEND_ENTRIES {
 				r.handleAppendEntries(req)
 			} else if req.Command == REQUEST_VOTE {
-				r.handleRequestVote(req)
+				if r.handleRequestVote(req) {
+					r.outbox <- &request{
+						Addr:    req.Addr,
+						Command: PEER_VOTED,
+						Term:    r.term,
+					}
+					r.state = FOLLOWER
+				}
 			}
 		}
 	}
 }
 
 func (r *replicator) heartbeat() {
-	DBG_INFO.Println(fmt.Sprintf("Replicator %d is now sending heartbeats.", r.server.Pid()))
-	defer DBG_INFO.Println(fmt.Sprintf("Replicator %d is not sending heartbeats any more.", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Replicator %d is now sending heartbeats.", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Replicator %d is not sending heartbeats any more.", r.server.Pid()))
 
 	for {
 		select {
@@ -354,8 +373,8 @@ func (r *replicator) heartbeat() {
 }
 
 func (r *replicator) handleTerminate(req *request) {
-	DBG_INFO.Println(fmt.Sprintf("Replicator %d has received a TERMINATE request.", r.server.Pid()))
-	defer DBG_INFO.Println(fmt.Sprintf("Replicator %d is now STOPPED.", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Replicator %d has received a TERMINATE request.", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Replicator %d is now STOPPED.", r.server.Pid()))
 
 	r.state = STOPPED
 	if req.Addr != r.server.Pid() {
@@ -364,7 +383,7 @@ func (r *replicator) handleTerminate(req *request) {
 }
 
 func (r *replicator) handleRequestVote(req *request) bool {
-	DBG_INFO.Println(fmt.Sprintf("Replicator %d has received a REQUEST_VOTE request.", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Replicator %d has received a REQUEST_VOTE request.", r.server.Pid()))
 
 	if req.Term < r.term {
 		return false
@@ -381,7 +400,7 @@ func (r *replicator) handleRequestVote(req *request) bool {
 }
 
 func (r *replicator) handleAppendEntries(req *request) bool {
-	DBG_INFO.Println(fmt.Sprintf("Replicator %d has received an APPEND_ENTRIES request.", r.server.Pid()))
+	INFO.Println(fmt.Sprintf("Replicator %d has received an APPEND_ENTRIES request.", r.server.Pid()))
 
 	if req.Term < r.term {
 		return false
