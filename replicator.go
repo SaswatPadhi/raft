@@ -19,7 +19,7 @@ const (
 
 // Deviation Thresholds
 const (
-	Election_Timeout_Deviation   = 0.1
+	Election_Timeout_Deviation   = 0.35
 	Heartbeat_Interval_Deviation = 0.05
 )
 
@@ -48,7 +48,7 @@ type request struct {
 }
 
 func (req *request) toString() string {
-	return fmt.Sprintf("{addr: %d,  comm: %s,  term: %d}", req.Addr, req.Command, req.Term)
+	return fmt.Sprintf("{addr: %d,  comm: %c,  term: %d}", req.Addr, req.Command, req.Term)
 }
 
 type raft_config struct {
@@ -63,9 +63,9 @@ type Replicator interface {
 	HeartbeatInterval() time.Duration
 	IsLeader() bool
 	IsRunning() bool
-	Start()
+	Start() error
 	State() int8
-	Stop()
+	Stop() error
 	Term() int64
 }
 
@@ -146,7 +146,7 @@ func (r *replicator) IsRunning() bool {
 	return r.state != STOPPED && r.state != ERROR
 }
 
-func (r *replicator) Start() {
+func (r *replicator) Start() (err error) {
 	if r.state == STOPPED {
 		r.state = FOLLOWER
 		r.server.Start()
@@ -155,13 +155,15 @@ func (r *replicator) Start() {
 		go r.monitorOutbox()
 		go r.serve()
 	}
+
+	return
 }
 
 func (r *replicator) State() int8 {
 	return r.state
 }
 
-func (r *replicator) Stop() {
+func (r *replicator) Stop() (err error) {
 	INFO.Println(fmt.Sprintf("Stopping replicator %d", r.server.Pid()))
 	defer INFO.Println(fmt.Sprintf("Replicator %d has fully stopped", r.server.Pid()))
 
@@ -183,6 +185,8 @@ func (r *replicator) Stop() {
 
 		<-r.stopped
 	}
+
+	return
 }
 
 func (r *replicator) Term() int64 {

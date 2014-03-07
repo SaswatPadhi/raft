@@ -1,6 +1,6 @@
 {
-    "Election_Timeout": 250,
-    "Heartbeat_Interval": 100,
+    "Election_Timeout": 512,
+    "Heartbeat_Interval": 72,
 
     "Cluster_Config_File": "cluster.json"
 }

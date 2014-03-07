@@ -14,9 +14,13 @@ import (
 
 const (
 	CONFIG_FILE = "raft.json"
+
+	MAX_N2_ITERATIONS = 4
 )
 
-func RaftSetup(t *testing.T, start bool) []Replicator {
+/*=======================================< HELPER ROUTINES >=======================================*/
+
+func RaftSetup(t *testing.T, do_start bool) []Replicator {
 	data, err := ioutil.ReadFile(CONFIG_FILE)
 	if err != nil {
 		t.Fatal(err.Error())
@@ -45,45 +49,57 @@ func RaftSetup(t *testing.T, start bool) []Replicator {
 			t.Error(err)
 		} else {
 			replics = append(replics, replic)
-			if start {
-				replic.Start()
-			}
 		}
 	}
 
+	if do_start {
+		RaftStart(t, replics)
+	}
 	return replics
 }
 
-func RaftTearDown(t *testing.T, replics []Replicator) {
+func RaftStart(t *testing.T, replics []Replicator) {
 	for _, replic := range replics {
-		replic.Stop()
+		if err := replic.Start(); err != nil {
+			t.Error(err)
+		}
 	}
 }
 
+func RaftStop(t *testing.T, replics []Replicator) {
+	for _, replic := range replics {
+		if err := replic.Stop(); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+/*========================================< TEST ROUTINES >========================================*/
+
 // TEST: Checks if a Raft cluster could be brought up and down successfully.
 func Test_RaftInitialize(t *testing.T) {
-	RaftTearDown(t, RaftSetup(t, false))
+	RaftStop(t, RaftSetup(t, false))
 }
 
 // TEST: Checks if a Raft cluster could be brought up and down successfully after it has been started.
 func Test_RaftInitializeAndStart(t *testing.T) {
-	RaftTearDown(t, RaftSetup(t, true))
+	RaftStop(t, RaftSetup(t, true))
 }
 
 // TEST: Checks if a Raft cluster with the same config could be brought up and down successfully multiple times.
 func Test_RaftMultipleUpDown(t *testing.T) {
-	RaftTearDown(t, RaftSetup(t, true))
-	RaftTearDown(t, RaftSetup(t, true))
-	RaftTearDown(t, RaftSetup(t, true))
+	for i := 0; i < 64; i++ {
+		RaftStop(t, RaftSetup(t, true))
+	}
 }
 
 // TEST: Leader elected after finite time
 func Test_LeaderElectionInFiniteTime(t *testing.T) {
 	replics := RaftSetup(t, true)
-	defer RaftTearDown(t, replics)
+	defer RaftStop(t, replics)
 
 	leader_found := false
-	max_iterations_to_monitor := len(replics) * len(replics)
+	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
 
 	for i := 0; i <= max_iterations_to_monitor && !leader_found; i++ {
 		<-time.After(replics[0].HeartbeatInterval())
@@ -104,11 +120,11 @@ func Test_LeaderElectionInFiniteTime(t *testing.T) {
 // TEST: Leader election with minority failures
 func Test_LeaderElectionWithMinorityFailures(t *testing.T) {
 	replics := RaftSetup(t, false)
-	defer RaftTearDown(t, replics)
+	defer RaftStop(t, replics)
 
 	var i int
 	leader_found := false
-	max_iterations_to_monitor := len(replics) * len(replics)
+	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
 
 	for i = len(replics) / 2; i < len(replics); i++ {
 		replics[i].Start()
@@ -133,10 +149,10 @@ func Test_LeaderElectionWithMinorityFailures(t *testing.T) {
 // TEST: Ensure only one leader exists
 func Test_SingleLeaderElectedInFiniteTime(t *testing.T) {
 	replics := RaftSetup(t, false)
-	defer RaftTearDown(t, replics)
+	defer RaftStop(t, replics)
 
 	leader_found := false
-	max_iterations_to_monitor := 2 * len(replics) * len(replics)
+	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
 
 	start_iters := make([]int, len(replics))
 	for i := 0; i < len(replics); i++ {
@@ -173,11 +189,11 @@ func Test_SingleLeaderElectedInFiniteTime(t *testing.T) {
 // TEST: Ensure only single leader with minority failures
 func Test_SingleLeaderElectedWithMinorityFailures(t *testing.T) {
 	replics := RaftSetup(t, false)
-	defer RaftTearDown(t, replics)
+	defer RaftStop(t, replics)
 
 	var i int
 	leader_found := false
-	max_iterations_to_monitor := 2 * len(replics) * len(replics)
+	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
 
 	stop_iters := make([]int, len(replics))
 	start_iters := make([]int, len(replics))
@@ -224,18 +240,18 @@ func Test_SingleLeaderElectedWithMinorityFailures(t *testing.T) {
 // TEST: Ensure only single leader after temporary partitioning
 func Test_SingleLeaderElectedAfterTempPartitioning(t *testing.T) {
 	replics := RaftSetup(t, true)
-	defer RaftTearDown(t, replics)
+	defer RaftStop(t, replics)
 
 	var i int
 	leader_found := false
-	max_iterations_to_monitor := 2 * len(replics) * len(replics)
+	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
 
 	stop_iters := make([]int, len(replics)/2)
 	start_iters := make([]int, len(replics)/2)
 
 	for i = 0; i < len(replics)/2; i++ {
-		stop_iters[i] = randInt(len(replics), 4*len(replics))
-		start_iters[i] = randInt(7*len(replics), 9*len(replics))
+		stop_iters[i] = randInt(len(replics), 2*len(replics))
+		start_iters[i] = randInt(2*len(replics), 5*len(replics))
 	}
 	active_partition := replics[0].(*replicator).server.Peers()[(len(replics)-1)/2:]
 
@@ -272,10 +288,10 @@ func Test_SingleLeaderElectedAfterTempPartitioning(t *testing.T) {
 // TEST: Leader election with majority failures
 func Test_LeaderElectionWithMajorityFailures(t *testing.T) {
 	replics := RaftSetup(t, false)
-	defer RaftTearDown(t, replics)
+	defer RaftStop(t, replics)
 
 	var i int
-	max_iterations_to_monitor := len(replics) * len(replics)
+	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
 
 	for i = 1 + (len(replics) / 2); i < len(replics); i++ {
 		replics[i].Start()
