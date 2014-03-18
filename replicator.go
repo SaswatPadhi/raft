@@ -3,13 +3,11 @@ package raft
 import (
 	"github.com/SaswatPadhi/cluster"
 
-	"encoding/gob"
 	"encoding/json"
 	"io/ioutil"
 
 	"bytes"
 	"fmt"
-	"log"
 	"time"
 )
 
@@ -33,24 +31,6 @@ const (
 	STOPPED
 )
 
-// Raft Commands
-const (
-	APPEND_ENTRIES = '0'
-	PEER_VOTED     = '1'
-	REQUEST_VOTE   = '2'
-	TERMINATE      = '3'
-)
-
-type request struct {
-	Addr    int
-	Command byte
-	Term    int64
-}
-
-func (req *request) toString() string {
-	return fmt.Sprintf("{addr: %d,  comm: %c,  term: %d}", req.Addr, req.Command, req.Term)
-}
-
 type raft_config struct {
 	Election_Timeout    int
 	Heartbeat_Interval  int
@@ -61,8 +41,8 @@ type raft_config struct {
 type Replicator interface {
 	ElectionTimeout() time.Duration
 	HeartbeatInterval() time.Duration
-	IsLeader() bool
 	IsRunning() bool
+	Leader() int
 	Start() error
 	State() int8
 	Stop() error
@@ -72,20 +52,17 @@ type Replicator interface {
 type replicator struct {
 	election_timeout   time.Duration
 	heartbeat_interval time.Duration
-	inbox              chan *request
+	inbox              chan *raft_msg
 	leader             int
-	outbox             chan *request
+	outbox             chan *raft_msg
 	server             *cluster.Server
 	state              int8
 	stop               chan bool
 	stopped            chan bool
 	stop_heartbeat     chan bool
 	term               int64
+	votes              int
 	voted_for          int
-}
-
-func init() {
-	gob.Register(request{})
 }
 
 func NewReplicator(id int, config_file string) (r *replicator, err error) {
@@ -95,15 +72,16 @@ func NewReplicator(id int, config_file string) (r *replicator, err error) {
 	r = &replicator{
 		election_timeout:   UNINITIALIZED,
 		heartbeat_interval: UNINITIALIZED,
-		inbox:              make(chan *request, 32),
+		inbox:              make(chan *raft_msg, 32),
 		leader:             UNINITIALIZED,
-		outbox:             make(chan *request, 32),
+		outbox:             make(chan *raft_msg, 32),
 		server:             nil,
 		state:              ERROR,
 		stop:               make(chan bool, 2),
 		stopped:            make(chan bool),
 		stop_heartbeat:     make(chan bool),
 		term:               0,
+		votes:              0,
 		voted_for:          UNINITIALIZED,
 	}
 
@@ -138,8 +116,8 @@ func (r *replicator) HeartbeatInterval() time.Duration {
 	return r.heartbeat_interval
 }
 
-func (r *replicator) IsLeader() bool {
-	return r.server.Pid() == r.leader
+func (r *replicator) Leader() int {
+	return r.leader
 }
 
 func (r *replicator) IsRunning() bool {
@@ -168,7 +146,6 @@ func (r *replicator) Stop() (err error) {
 	defer INFO.Println(fmt.Sprintf("Replicator %d has fully stopped", r.server.Pid()))
 
 	if r.state != STOPPED && r.state != ERROR {
-
 		// Stop the monitorinbox and monitoroutbox
 		r.stop <- true
 		r.stop <- true
@@ -177,10 +154,9 @@ func (r *replicator) Stop() (err error) {
 		r.server.Stop()
 
 		// Issue a TERMINATE command to be picked up by current serve routine
-		r.inbox <- &request{
-			Addr:    r.server.Pid(),
+		r.inbox <- &raft_msg{
 			Command: TERMINATE,
-			Term:    r.term,
+			Addr:    r.server.Pid(),
 		}
 
 		<-r.stopped
@@ -200,9 +176,9 @@ func (r *replicator) monitorInbox() {
 	for {
 		select {
 		case env := <-r.server.Inbox():
-			new_req := env.Msg.(request)
-			INFO.Println(fmt.Sprintf(" Replic %d <- %s", r.server.Pid(), new_req.toString()))
-			r.inbox <- &new_req
+			new_msg := env.Msg.(raft_msg)
+			INFO.Println(fmt.Sprintf(" Replic %d <- %s", r.server.Pid(), new_msg.toString()))
+			r.inbox <- &new_msg
 		case <-r.stop:
 			return
 		}
@@ -215,14 +191,14 @@ func (r *replicator) monitorOutbox() {
 
 	for {
 		select {
-		case req := <-r.outbox:
-			INFO.Println(fmt.Sprintf(" Replic %d -> %s", r.server.Pid(), req.toString()))
-			target := req.Addr
-			req.Addr = r.server.Pid()
+		case msg := <-r.outbox:
+			INFO.Println(fmt.Sprintf(" Replic %d -> %s", r.server.Pid(), msg.toString()))
+			target := msg.Addr
+			msg.Addr = r.server.Pid()
 			env := &cluster.Envelope{
 				Pid:   target,
 				MsgId: UNINITIALIZED,
-				Msg:   req,
+				Msg:   msg,
 			}
 			r.server.Outbox() <- env
 		case <-r.stop:
@@ -256,41 +232,30 @@ func (r *replicator) serveAsCandidate() {
 
 	r.state = CANDIDATE
 	r.leader = UNINITIALIZED
-
 	for r.state == CANDIDATE {
 		// Increment the replicator's term & self-vote
 		r.term++
-		votes_in_for := 1
+		r.votes = 1
 		r.voted_for = r.server.Pid()
 
 		// Broadcast a RequestVote
-		r.outbox <- &request{
-			Addr:    cluster.BROADCAST,
+		r.outbox <- &raft_msg{
 			Command: REQUEST_VOTE,
+			Addr:    cluster.BROADCAST,
 			Term:    r.term,
 		}
 
 		timed_out := false
 		for !timed_out && r.state == CANDIDATE {
 			// Become leader if have majority votes
-			if votes_in_for > len(r.server.Peers())/2 {
+			if r.votes > len(r.server.Peers())/2 {
 				r.state = LEADER
 				break
 			}
 
 			select {
-			case req := <-r.inbox:
-				if req.Command == TERMINATE {
-					r.handleTerminate(req)
-				} else if req.Command == REQUEST_VOTE {
-					r.handleRequestVote(req)
-				} else if req.Command == APPEND_ENTRIES {
-					if r.handleAppendEntries(req) {
-						r.state = FOLLOWER
-					}
-				} else if req.Command == PEER_VOTED {
-					votes_in_for++
-				}
+			case msg := <-r.inbox:
+				r.handleRaftMessage(msg)
 
 			case <-time.After(r.election_timeout):
 				timed_out = true
@@ -304,23 +269,10 @@ func (r *replicator) serveAsFollower() {
 	defer INFO.Println(fmt.Sprintf("Replicator %d is no more a FOLLOWER", r.server.Pid()))
 
 	r.state = FOLLOWER
-
 	for r.state == FOLLOWER {
 		select {
-		case req := <-r.inbox:
-			if req.Command == TERMINATE {
-				r.handleTerminate(req)
-			} else if req.Command == REQUEST_VOTE {
-				if r.handleRequestVote(req) {
-					r.outbox <- &request{
-						Addr:    req.Addr,
-						Command: PEER_VOTED,
-						Term:    r.term,
-					}
-				}
-			} else if req.Command == APPEND_ENTRIES {
-				r.handleAppendEntries(req)
-			}
+		case msg := <-r.inbox:
+			r.handleRaftMessage(msg)
 
 		case <-time.After(r.election_timeout):
 			r.state = CANDIDATE
@@ -336,24 +288,11 @@ func (r *replicator) serveAsLeader() {
 	r.leader = r.server.Pid()
 
 	go r.heartbeat()
+
 	for r.state == LEADER {
 		select {
-		case req := <-r.inbox:
-			if req.Command == TERMINATE {
-				r.stop_heartbeat <- true
-				r.handleTerminate(req)
-			} else if req.Command == APPEND_ENTRIES {
-				r.handleAppendEntries(req)
-			} else if req.Command == REQUEST_VOTE {
-				if r.handleRequestVote(req) {
-					r.outbox <- &request{
-						Addr:    req.Addr,
-						Command: PEER_VOTED,
-						Term:    r.term,
-					}
-					r.state = FOLLOWER
-				}
-			}
+		case msg := <-r.inbox:
+			r.handleRaftMessage(msg)
 		}
 	}
 }
@@ -367,51 +306,81 @@ func (r *replicator) heartbeat() {
 		case <-r.stop_heartbeat:
 			return
 		case <-time.After(r.heartbeat_interval):
-			r.outbox <- &request{
-				Addr:    cluster.BROADCAST,
+			r.outbox <- &raft_msg{
 				Command: APPEND_ENTRIES,
+				Addr:    cluster.BROADCAST,
 				Term:    r.term,
+				Leader:  r.leader,
 			}
 		}
 	}
 }
 
-func (r *replicator) handleTerminate(req *request) {
+func (r *replicator) handleRaftMessage(msg *raft_msg) {
+	if msg.Term > r.term {
+		r.term = msg.Term
+		r.state = FOLLOWER
+		r.voted_for = UNINITIALIZED
+	}
+
+	switch msg.Command {
+	case TERMINATE:
+		r.handleTerminate(msg)
+
+	case REQUEST_VOTE:
+		r.handleRequestVote(msg)
+	case REQUEST_VOTE_RESP:
+		if r.state == CANDIDATE && msg.Result == true {
+			r.votes++
+		}
+
+	case APPEND_ENTRIES:
+		r.handleAppendEntries(msg)
+	case APPEND_ENTRIES_RESP:
+	}
+}
+
+func (r *replicator) handleTerminate(msg *raft_msg) {
 	INFO.Println(fmt.Sprintf("Replicator %d has received a TERMINATE request.", r.server.Pid()))
 	defer INFO.Println(fmt.Sprintf("Replicator %d is now STOPPED.", r.server.Pid()))
 
 	r.state = STOPPED
-	if req.Addr != r.server.Pid() {
-		log.Panicln("TERMINATE command received from another server! ABORTING")
+	if msg.Addr != r.server.Pid() {
+		EROR.Println("TERMINATE command received from another server! ABORTING")
 	}
 }
 
-func (r *replicator) handleRequestVote(req *request) bool {
-	INFO.Println(fmt.Sprintf("Replicator %d has received a REQUEST_VOTE request.", r.server.Pid()))
+func (r *replicator) handleRequestVote(msg *raft_msg) {
+	INFO.Println(fmt.Sprintf("Replicator %d has received a REQUEST_VOTE request from %d.", r.server.Pid(), msg.Addr))
 
-	if req.Term < r.term {
-		return false
+	resp := &raft_msg{
+		Term:    r.term,
+		Addr:    msg.Addr,
+		Command: REQUEST_VOTE_RESP,
+		Result:  false,
 	}
 
-	r.term = req.Term
-
-	if r.voted_for != UNINITIALIZED {
-		return false
+	if msg.Term == r.term && r.voted_for == UNINITIALIZED {
+		r.voted_for = msg.Addr
+		resp.Result = true
 	}
-	r.voted_for = req.Addr
 
-	return true
+	r.outbox <- resp
 }
 
-func (r *replicator) handleAppendEntries(req *request) bool {
-	INFO.Println(fmt.Sprintf("Replicator %d has received an APPEND_ENTRIES request.", r.server.Pid()))
+func (r *replicator) handleAppendEntries(msg *raft_msg) {
+	INFO.Println(fmt.Sprintf("Replicator %d has received an APPEND_ENTRIES request from %d.", r.server.Pid(), msg.Addr))
 
-	if req.Term < r.term {
-		return false
+	resp := &raft_msg{
+		Term:    r.term,
+		Addr:    msg.Addr,
+		Command: APPEND_ENTRIES_RESP,
+		Result:  false,
 	}
 
-	r.term = req.Term
-	r.leader = req.Addr
+	if msg.Term == r.term {
+		resp.Result = true
+	}
 
-	return true
+	r.outbox <- resp
 }
