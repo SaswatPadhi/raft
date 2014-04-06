@@ -41,45 +41,69 @@ type raft_config struct {
 type Replicator interface {
 	ElectionTimeout() time.Duration
 	HeartbeatInterval() time.Duration
+	Inbox() chan<- interface{}
 	IsRunning() bool
+	Id() int
 	Leader() int
+	Outbox() <-chan ClientResponse
 	Start() error
 	State() int8
 	Stop() error
 	Term() int64
 }
 
+type StateMachine interface {
+	Apply(interface{}) interface{}
+}
+
+type ClientResponse struct {
+	raft_resp bool
+	sm_resp   interface{}
+}
+
 type replicator struct {
 	election_timeout   time.Duration
 	heartbeat_interval time.Duration
-	inbox              chan *raft_msg
+	inbox              chan interface{}
+	internal_inbox     chan *raft_msg
+	internal_outbox    chan *raft_msg
 	leader             int
-	outbox             chan *raft_msg
+	log                *raft_log
+	outbox             chan ClientResponse
+	machine            StateMachine
+	matchIndex         map[int]int
+	nextIndex          map[int]int
 	server             *cluster.Server
 	state              int8
 	stop               chan bool
 	stopped            chan bool
-	stop_heartbeat     chan bool
 	term               int64
 	votes              int
 	voted_for          int
 }
 
-func NewReplicator(id int, config_file string) (r *replicator, err error) {
+/*======================================< PUBLIC INTERFACE >======================================*/
+
+func NewReplicator(id int, sm StateMachine, config_file string) (r *replicator, err error) {
 	INFO.Println(fmt.Sprintf("Creating replicator [id: %d, config: %s]", id, config_file))
 	defer INFO.Println(fmt.Sprintf("Replicator creation returns [err: %s]", err))
 
 	r = &replicator{
 		election_timeout:   UNINITIALIZED,
 		heartbeat_interval: UNINITIALIZED,
-		inbox:              make(chan *raft_msg, 32),
+		inbox:              make(chan interface{}, 32),
+		internal_inbox:     make(chan *raft_msg, 32),
+		internal_outbox:    make(chan *raft_msg, 32),
 		leader:             UNINITIALIZED,
-		outbox:             make(chan *raft_msg, 32),
+		log:                &raft_log{-1, -1, nil},
+		outbox:             make(chan ClientResponse, 32),
+		machine:            sm,
+		matchIndex:         nil,
+		nextIndex:          nil,
 		server:             nil,
 		state:              ERROR,
 		stop:               make(chan bool, 2),
 		stopped:            make(chan bool),
-		stop_heartbeat:     make(chan bool),
 		term:               0,
 		votes:              0,
 		voted_for:          UNINITIALIZED,
@@ -116,21 +140,33 @@ func (r *replicator) HeartbeatInterval() time.Duration {
 	return r.heartbeat_interval
 }
 
-func (r *replicator) Leader() int {
-	return r.leader
+func (r *replicator) Id() int {
+	return r.server.Pid()
+}
+
+func (r *replicator) Inbox() chan<- interface{} {
+	return r.inbox
 }
 
 func (r *replicator) IsRunning() bool {
 	return r.state != STOPPED && r.state != ERROR
 }
 
+func (r *replicator) Leader() int {
+	return r.leader
+}
+
+func (r *replicator) Outbox() <-chan ClientResponse {
+	return r.outbox
+}
+
 func (r *replicator) Start() (err error) {
 	if r.state == STOPPED {
 		r.state = FOLLOWER
-		r.server.Start()
 
-		go r.monitorInbox()
-		go r.monitorOutbox()
+		r.server.Start()
+		go r.monitorInternalInbox()
+		go r.monitorInternalOutbox()
 		go r.serve()
 	}
 
@@ -146,17 +182,14 @@ func (r *replicator) Stop() (err error) {
 	defer INFO.Println(fmt.Sprintf("Replicator %d has fully stopped", r.server.Pid()))
 
 	if r.state != STOPPED && r.state != ERROR {
-		// Stop the monitorinbox and monitoroutbox
 		r.stop <- true
 		r.stop <- true
 
-		// Stop the underlying cluster server
 		r.server.Stop()
 
-		// Issue a TERMINATE command to be picked up by current serve routine
-		r.inbox <- &raft_msg{
-			Command: TERMINATE,
-			Addr:    r.server.Pid(),
+		r.internal_inbox <- &raft_msg{
+			RPC:  TERMINATE,
+			Addr: r.server.Pid(),
 		}
 
 		<-r.stopped
@@ -169,7 +202,9 @@ func (r *replicator) Term() int64 {
 	return r.term
 }
 
-func (r *replicator) monitorInbox() {
+/*======================================< MONITOR ROUTINES >======================================*/
+
+func (r *replicator) monitorInternalInbox() {
 	INFO.Println(fmt.Sprintf("Inbox monitor for replicator %d started", r.server.Pid()))
 	defer INFO.Println(fmt.Sprintf("Inbox monitor for replicator %d stopped", r.server.Pid()))
 
@@ -178,20 +213,20 @@ func (r *replicator) monitorInbox() {
 		case env := <-r.server.Inbox():
 			new_msg := env.Msg.(raft_msg)
 			INFO.Println(fmt.Sprintf(" Replic %d <- %s", r.server.Pid(), new_msg.toString()))
-			r.inbox <- &new_msg
+			r.internal_inbox <- &new_msg
 		case <-r.stop:
 			return
 		}
 	}
 }
 
-func (r *replicator) monitorOutbox() {
+func (r *replicator) monitorInternalOutbox() {
 	INFO.Println(fmt.Sprintf("Outbox monitor for replicator %d started", r.server.Pid()))
 	defer INFO.Println(fmt.Sprintf("Outbox monitor for replicator %d stopped", r.server.Pid()))
 
 	for {
 		select {
-		case msg := <-r.outbox:
+		case msg := <-r.internal_outbox:
 			INFO.Println(fmt.Sprintf(" Replic %d -> %s", r.server.Pid(), msg.toString()))
 			target := msg.Addr
 			msg.Addr = r.server.Pid()
@@ -206,6 +241,8 @@ func (r *replicator) monitorOutbox() {
 		}
 	}
 }
+
+/*=======================================< SERVE ROUTINES >========================================*/
 
 func (r *replicator) serve() {
 	INFO.Println(fmt.Sprintf("Serve routine for replicator %d started", r.server.Pid()))
@@ -239,10 +276,12 @@ func (r *replicator) serveAsCandidate() {
 		r.voted_for = r.server.Pid()
 
 		// Broadcast a RequestVote
-		r.outbox <- &raft_msg{
-			Command: REQUEST_VOTE,
-			Addr:    cluster.BROADCAST,
-			Term:    r.term,
+		r.internal_outbox <- &raft_msg{
+			RPC:          REQUEST_VOTE,
+			Addr:         cluster.BROADCAST,
+			Term:         r.term,
+			PrevLogIndex: r.log.getPrevIndex(),
+			PrevLogTerm:  r.log.getPrevTerm(),
 		}
 
 		timed_out := false
@@ -254,7 +293,13 @@ func (r *replicator) serveAsCandidate() {
 			}
 
 			select {
-			case msg := <-r.inbox:
+			case <-r.inbox:
+				r.outbox <- ClientResponse{
+					raft_resp: false,
+					sm_resp:   nil,
+				}
+
+			case msg := <-r.internal_inbox:
 				r.handleRaftMessage(msg)
 
 			case <-time.After(r.election_timeout):
@@ -271,7 +316,13 @@ func (r *replicator) serveAsFollower() {
 	r.state = FOLLOWER
 	for r.state == FOLLOWER {
 		select {
-		case msg := <-r.inbox:
+		case <-r.inbox:
+			r.outbox <- ClientResponse{
+				raft_resp: false,
+				sm_resp:   nil,
+			}
+
+		case msg := <-r.internal_inbox:
 			r.handleRaftMessage(msg)
 
 		case <-time.After(r.election_timeout):
@@ -286,44 +337,79 @@ func (r *replicator) serveAsLeader() {
 
 	r.state = LEADER
 	r.leader = r.server.Pid()
+	r.nextIndex = make(map[int]int)
+	r.matchIndex = make(map[int]int)
 
-	go r.heartbeat()
+	for _, peer := range r.server.Peers() {
+		r.matchIndex[peer] = -1
+		r.nextIndex[peer] = len(r.log.entries)
+	}
+
+	r.broadcastAppendEntries()
 
 	for r.state == LEADER {
 		select {
-		case msg := <-r.inbox:
+		case cmd := <-r.inbox:
+			r.handleStateMachineCommand(cmd)
+
+		case msg := <-r.internal_inbox:
 			r.handleRaftMessage(msg)
+
+		case <-time.After(r.heartbeat_interval):
+			r.broadcastAppendEntries()
 		}
 	}
 }
 
-func (r *replicator) heartbeat() {
-	INFO.Println(fmt.Sprintf("Replicator %d is now sending heartbeats.", r.server.Pid()))
-	defer INFO.Println(fmt.Sprintf("Replicator %d is not sending heartbeats any more.", r.server.Pid()))
+/*========================================< LEADER HELPERS >=========================================*/
 
-	for {
-		select {
-		case <-r.stop_heartbeat:
-			return
-		case <-time.After(r.heartbeat_interval):
-			r.outbox <- &raft_msg{
-				Command: APPEND_ENTRIES,
-				Addr:    cluster.BROADCAST,
-				Term:    r.term,
-				Leader:  r.leader,
+func (r *replicator) broadcastAppendEntries() {
+	INFO.Println(fmt.Sprintf("Replicator %d is now sending AEs.", r.server.Pid()))
+	defer INFO.Println(fmt.Sprintf("Replicator %d has sent AEs.", r.server.Pid()))
+
+	for _, peer := range r.server.Peers() {
+		entries, pTerm := r.log.getEntriesAtAndAfter(r.nextIndex[peer])
+		r.internal_outbox <- &raft_msg{
+			RPC:               APPEND_ENTRIES,
+			Addr:              peer,
+			Term:              r.term,
+			Leader:            r.leader,
+			Entries:           entries,
+			PrevLogTerm:       pTerm,
+			PrevLogIndex:      r.nextIndex[peer] - 1,
+			LeaderCommitIndex: r.log.commitIndex,
+		}
+	}
+}
+
+func (r *replicator) handleStateMachineCommand(cmd interface{}) {
+	r.log.createAndAddNewEntry(cmd, r.term)
+
+	if len(r.server.Peers()) == 0 {
+		r.log.commitIndex = len(r.log.entries) - 1
+		if r.machine != nil {
+			r.outbox <- ClientResponse{
+				raft_resp: true,
+				sm_resp:   r.machine.Apply(cmd),
 			}
 		}
+		r.log.lastApplied = r.log.commitIndex
 	}
 }
+
+/*========================================< RPC HANDLERS >=========================================*/
 
 func (r *replicator) handleRaftMessage(msg *raft_msg) {
 	if msg.Term > r.term {
 		r.term = msg.Term
-		r.state = FOLLOWER
 		r.voted_for = UNINITIALIZED
+		if r.state != FOLLOWER {
+			r.state = FOLLOWER
+			r.leader = UNINITIALIZED
+		}
 	}
 
-	switch msg.Command {
+	switch msg.RPC {
 	case TERMINATE:
 		r.handleTerminate(msg)
 
@@ -337,6 +423,38 @@ func (r *replicator) handleRaftMessage(msg *raft_msg) {
 	case APPEND_ENTRIES:
 		r.handleAppendEntries(msg)
 	case APPEND_ENTRIES_RESP:
+		if r.state == LEADER {
+			if msg.Result == true {
+				r.matchIndex[msg.Addr] = msg.PrevLogIndex
+				r.nextIndex[msg.Addr] = r.matchIndex[msg.Addr] + 1
+
+				synced := 0
+				var minMatchIndex int = len(r.log.entries)
+				for _, index := range r.matchIndex {
+					if index > r.log.commitIndex {
+						synced++
+						if index < minMatchIndex {
+							minMatchIndex = index
+						}
+					}
+				}
+
+				if synced > len(r.server.Peers())/2 && r.log.entries[minMatchIndex].Term == r.term {
+					r.log.commitIndex = minMatchIndex
+					if r.log.commitIndex > r.log.lastApplied && r.machine != nil {
+						for i := r.log.lastApplied + 1; i <= r.log.commitIndex; i++ {
+							r.outbox <- ClientResponse{
+								raft_resp: true,
+								sm_resp:   r.machine.Apply(r.log.entries[i].Data),
+							}
+						}
+						r.log.lastApplied = r.log.commitIndex
+					}
+				}
+			} else {
+				r.nextIndex[msg.Addr]--
+			}
+		}
 	}
 }
 
@@ -346,7 +464,7 @@ func (r *replicator) handleTerminate(msg *raft_msg) {
 
 	r.state = STOPPED
 	if msg.Addr != r.server.Pid() {
-		EROR.Println("TERMINATE command received from another server! ABORTING")
+		EROR.Println("TERMINATE RPC received from another server! ABORTING")
 	}
 }
 
@@ -354,33 +472,48 @@ func (r *replicator) handleRequestVote(msg *raft_msg) {
 	INFO.Println(fmt.Sprintf("Replicator %d has received a REQUEST_VOTE request from %d.", r.server.Pid(), msg.Addr))
 
 	resp := &raft_msg{
-		Term:    r.term,
-		Addr:    msg.Addr,
-		Command: REQUEST_VOTE_RESP,
-		Result:  false,
+		Term:   r.term,
+		Addr:   msg.Addr,
+		RPC:    REQUEST_VOTE_RESP,
+		Result: false,
 	}
 
-	if msg.Term == r.term && r.voted_for == UNINITIALIZED {
+	if msg.Term == r.term && r.voted_for == UNINITIALIZED && r.log.getPrevTerm() <= msg.PrevLogTerm && r.log.getPrevIndex() <= msg.PrevLogIndex {
 		r.voted_for = msg.Addr
 		resp.Result = true
 	}
 
-	r.outbox <- resp
+	r.internal_outbox <- resp
 }
 
 func (r *replicator) handleAppendEntries(msg *raft_msg) {
 	INFO.Println(fmt.Sprintf("Replicator %d has received an APPEND_ENTRIES request from %d.", r.server.Pid(), msg.Addr))
 
 	resp := &raft_msg{
-		Term:    r.term,
-		Addr:    msg.Addr,
-		Command: APPEND_ENTRIES_RESP,
-		Result:  false,
+		Term:   r.term,
+		Addr:   msg.Addr,
+		RPC:    APPEND_ENTRIES_RESP,
+		Result: false,
 	}
 
 	if msg.Term == r.term {
-		resp.Result = true
+		r.leader = msg.Leader
+		if err := r.log.check(msg.PrevLogTerm, msg.PrevLogIndex); err == nil {
+			resp.Result = true
+			r.log.addEntries(msg.Entries)
+			r.log.commitIndex = msg.LeaderCommitIndex
+			if r.log.commitIndex > r.log.lastApplied && r.machine != nil {
+				for i := r.log.lastApplied + 1; i <= r.log.commitIndex; i++ {
+					r.outbox <- ClientResponse{
+						raft_resp: true,
+						sm_resp:   r.machine.Apply(r.log.entries[i].Data),
+					}
+				}
+				r.log.lastApplied = r.log.commitIndex
+			}
+			resp.PrevLogIndex = len(r.log.entries) - 1
+		}
 	}
 
-	r.outbox <- resp
+	r.internal_outbox <- resp
 }

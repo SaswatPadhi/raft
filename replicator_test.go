@@ -8,6 +8,7 @@ import (
 
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,7 +21,7 @@ const (
 
 /*=======================================< HELPER ROUTINES >=======================================*/
 
-func RaftSetup(t *testing.T, do_start bool) []Replicator {
+func RaftSetup(t *testing.T, sm StateMachine, do_start bool) []Replicator {
 	data, err := ioutil.ReadFile(CONFIG_FILE)
 	if err != nil {
 		t.Fatal(err.Error())
@@ -44,7 +45,7 @@ func RaftSetup(t *testing.T, do_start bool) []Replicator {
 			t.Error(err)
 		}
 
-		replic, err := NewReplicator(p.Pid, CONFIG_FILE)
+		replic, err := NewReplicator(p.Pid, sm, CONFIG_FILE)
 		if err != nil {
 			t.Error(err)
 		} else {
@@ -78,24 +79,24 @@ func RaftStop(t *testing.T, replics []Replicator) {
 
 // TEST: Checks if a Raft cluster could be brought up and down successfully.
 func Test_RaftInitialize(t *testing.T) {
-	RaftStop(t, RaftSetup(t, false))
+	RaftStop(t, RaftSetup(t, nil, false))
 }
 
 // TEST: Checks if a Raft cluster could be brought up and down successfully after it has been started.
 func Test_RaftInitializeAndStart(t *testing.T) {
-	RaftStop(t, RaftSetup(t, true))
+	RaftStop(t, RaftSetup(t, nil, true))
 }
 
 // TEST: Checks if a Raft cluster with the same config could be brought up and down successfully multiple times.
 func Test_RaftMultipleUpDown(t *testing.T) {
 	for i := 0; i < 64; i++ {
-		RaftStop(t, RaftSetup(t, true))
+		RaftStop(t, RaftSetup(t, nil, true))
 	}
 }
 
 // TEST: Leader elected after finite time
 func Test_LeaderElectionInFiniteTime(t *testing.T) {
-	replics := RaftSetup(t, true)
+	replics := RaftSetup(t, nil, true)
 	defer RaftStop(t, replics)
 
 	leader_found := false
@@ -119,7 +120,7 @@ func Test_LeaderElectionInFiniteTime(t *testing.T) {
 
 // TEST: Leader election with minority failures
 func Test_LeaderElectionWithMinorityFailures(t *testing.T) {
-	replics := RaftSetup(t, false)
+	replics := RaftSetup(t, nil, false)
 	defer RaftStop(t, replics)
 
 	var i int
@@ -148,7 +149,7 @@ func Test_LeaderElectionWithMinorityFailures(t *testing.T) {
 
 // TEST: Ensure only one leader exists
 func Test_SingleLeaderElectedInFiniteTime(t *testing.T) {
-	replics := RaftSetup(t, false)
+	replics := RaftSetup(t, nil, false)
 	defer RaftStop(t, replics)
 
 	leader_found := false
@@ -188,7 +189,7 @@ func Test_SingleLeaderElectedInFiniteTime(t *testing.T) {
 
 // TEST: Ensure only single leader with minority failures
 func Test_SingleLeaderElectedWithMinorityFailures(t *testing.T) {
-	replics := RaftSetup(t, false)
+	replics := RaftSetup(t, nil, false)
 	defer RaftStop(t, replics)
 
 	var i int
@@ -239,7 +240,7 @@ func Test_SingleLeaderElectedWithMinorityFailures(t *testing.T) {
 
 // TEST: Ensure only single leader after temporary partitioning
 func Test_SingleLeaderElectedAfterTempPartitioning(t *testing.T) {
-	replics := RaftSetup(t, true)
+	replics := RaftSetup(t, nil, true)
 	defer RaftStop(t, replics)
 
 	var i int
@@ -287,7 +288,7 @@ func Test_SingleLeaderElectedAfterTempPartitioning(t *testing.T) {
 
 // TEST: Leader election with majority failures
 func Test_LeaderElectionWithMajorityFailures(t *testing.T) {
-	replics := RaftSetup(t, false)
+	replics := RaftSetup(t, nil, false)
 	defer RaftStop(t, replics)
 
 	var i int
@@ -303,6 +304,159 @@ func Test_LeaderElectionWithMajorityFailures(t *testing.T) {
 		for _, replic := range replics {
 			if replic.State() == LEADER {
 				t.Fatalf("Leader found with majority failures.")
+			}
+		}
+	}
+}
+
+/*=======================================< KV STORE >=======================================*/
+
+type KVMachine struct {
+	dict map[string]string
+}
+
+type KVMachineResp struct {
+	status string
+	result string
+}
+
+func (kvm *KVMachine) Apply(cmd interface{}) interface{} {
+	resp := &KVMachineResp{
+		status: "error",
+		result: "",
+	}
+
+	switch cmd.(type) {
+	case string:
+		parts := strings.Split(cmd.(string), " ")
+		switch parts[0] {
+		case "GET":
+			if len(parts) > 1 {
+				val, found := kvm.dict[parts[1]]
+				if found {
+					resp.status = "good"
+					resp.result = val
+				} else {
+					resp.status = "bad"
+				}
+			}
+		case "SET":
+			if len(parts) > 2 {
+				kvm.dict[parts[1]] = parts[2]
+				resp.status = "good"
+			}
+		}
+	}
+
+	return resp
+}
+
+func Test_KVMachine(t *testing.T) {
+	replics := RaftSetup(t, &KVMachine{dict: make(map[string]string)}, true)
+	defer RaftStop(t, replics)
+
+	var leader Replicator = nil
+	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
+
+	for i := 0; i <= max_iterations_to_monitor && leader == nil; i++ {
+		<-time.After(replics[0].HeartbeatInterval())
+
+		for _, replic := range replics {
+			if replic.State() == LEADER {
+				leader = replic
+				break
+			}
+		}
+	}
+
+	if leader == nil {
+		t.Fatalf("No leader found.")
+	}
+
+	var req string
+	var resp ClientResponse
+
+	req = "SET Apple Fruit"
+	leader.Inbox() <- req
+	select {
+	case <-time.After(replics[0].HeartbeatInterval() * time.Duration(len(replics)*MAX_N2_ITERATIONS)):
+		t.Fatalf("Time out waiting for leader's response!")
+
+	case resp = <-leader.Outbox():
+		if !resp.raft_resp {
+			t.Errorf("Leader ignored request!")
+		} else {
+			synced := 0
+			for _, replic := range replics {
+				if len(replic.(*replicator).log.entries) > 0 && replic.(*replicator).log.entries[0].Data.(string) == req {
+					synced++
+				}
+			}
+
+			if synced < (len(replics)+1)/2 {
+				t.Errorf("Log not replicated on majority, but committed on leader!")
+			}
+
+			if resp.sm_resp.(*KVMachineResp).status != "good" {
+				t.Errorf("KVMachine did not return good on SET.")
+			}
+		}
+	}
+
+	req = "SET Rose Flower"
+	leader.Inbox() <- req
+	select {
+	case <-time.After(replics[0].HeartbeatInterval() * time.Duration(len(replics)*MAX_N2_ITERATIONS)):
+		t.Fatalf("Time out waiting for leader's response!")
+
+	case resp = <-leader.Outbox():
+		if !resp.raft_resp {
+			t.Errorf("Leader ignored request!")
+		} else {
+			synced := 0
+			for _, replic := range replics {
+				if len(replic.(*replicator).log.entries) > 1 && replic.(*replicator).log.entries[1].Data.(string) == req {
+					synced++
+				}
+			}
+
+			if synced < (len(replics)+1)/2 {
+				t.Errorf("Log not replicated on majority, but committed on leader!")
+			}
+
+			if resp.sm_resp.(*KVMachineResp).status != "good" {
+				t.Errorf("KVMachine did not return good on SET.")
+			}
+		}
+	}
+
+	req = "GET Apple"
+	leader.Inbox() <- req
+	select {
+	case <-time.After(replics[0].HeartbeatInterval() * time.Duration(len(replics)*MAX_N2_ITERATIONS)):
+		t.Fatalf("Time out waiting for leader's response!")
+
+	case resp = <-leader.Outbox():
+		if !resp.raft_resp {
+			t.Errorf("Leader ignored request!")
+		} else {
+			synced := 0
+			for _, replic := range replics {
+				if len(replic.(*replicator).log.entries) > 2 && replic.(*replicator).log.entries[2].Data.(string) == req {
+					synced++
+				}
+			}
+
+			if synced < (len(replics)+1)/2 {
+				t.Errorf("Log not replicated on majority, but committed on leader!")
+			}
+
+			if resp.sm_resp.(*KVMachineResp).status != "good" {
+				t.Errorf("KVMachine did not return good on GET.")
+			}
+
+			if resp.sm_resp.(*KVMachineResp).result != "Fruit" {
+				t.Errorf("KVMachine returned wrong value for key Apple.")
 			}
 		}
 	}
