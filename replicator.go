@@ -364,36 +364,40 @@ func (r *replicator) serveAsLeader() {
 /*========================================< LEADER HELPERS >=========================================*/
 
 func (r *replicator) broadcastAppendEntries() {
-	INFO.Println(fmt.Sprintf("Replicator %d is now sending AEs.", r.server.Pid()))
-	defer INFO.Println(fmt.Sprintf("Replicator %d has sent AEs.", r.server.Pid()))
+	if r.state == LEADER {
+		INFO.Println(fmt.Sprintf("Replicator %d is now sending AEs.", r.server.Pid()))
+		defer INFO.Println(fmt.Sprintf("Replicator %d has sent AEs.", r.server.Pid()))
 
-	for _, peer := range r.server.Peers() {
-		entries, pTerm := r.log.getEntriesAtAndAfter(r.nextIndex[peer])
-		r.internal_outbox <- &raft_msg{
-			RPC:               APPEND_ENTRIES,
-			Addr:              peer,
-			Term:              r.term,
-			Leader:            r.leader,
-			Entries:           entries,
-			PrevLogTerm:       pTerm,
-			PrevLogIndex:      r.nextIndex[peer] - 1,
-			LeaderCommitIndex: r.log.commitIndex,
+		for _, peer := range r.server.Peers() {
+			entries, pTerm := r.log.getEntriesAtAndAfter(r.nextIndex[peer])
+			r.internal_outbox <- &raft_msg{
+				RPC:               APPEND_ENTRIES,
+				Addr:              peer,
+				Term:              r.term,
+				Leader:            r.leader,
+				Entries:           entries,
+				PrevLogTerm:       pTerm,
+				PrevLogIndex:      r.nextIndex[peer] - 1,
+				LeaderCommitIndex: r.log.commitIndex,
+			}
 		}
 	}
 }
 
 func (r *replicator) handleStateMachineCommand(cmd interface{}) {
-	r.log.createAndAddNewEntry(cmd, r.term)
+	if r.state == LEADER {
+		r.log.createAndAddNewEntry(cmd, r.term)
 
-	if len(r.server.Peers()) == 0 {
-		r.log.commitIndex = len(r.log.entries) - 1
-		if r.machine != nil {
-			r.outbox <- ClientResponse{
-				raft_resp: true,
-				sm_resp:   r.machine.Apply(cmd),
+		if len(r.server.Peers()) == 0 {
+			r.log.commitIndex = len(r.log.entries) - 1
+			if r.machine != nil {
+				r.outbox <- ClientResponse{
+					raft_resp: true,
+					sm_resp:   r.machine.Apply(cmd),
+				}
 			}
+			r.log.lastApplied = r.log.commitIndex
 		}
-		r.log.lastApplied = r.log.commitIndex
 	}
 }
 
@@ -504,10 +508,7 @@ func (r *replicator) handleAppendEntries(msg *raft_msg) {
 			r.log.commitIndex = msg.LeaderCommitIndex
 			if r.log.commitIndex > r.log.lastApplied && r.machine != nil {
 				for i := r.log.lastApplied + 1; i <= r.log.commitIndex; i++ {
-					r.outbox <- ClientResponse{
-						raft_resp: true,
-						sm_resp:   r.machine.Apply(r.log.entries[i].Data),
-					}
+					r.machine.Apply(r.log.entries[i].Data)
 				}
 				r.log.lastApplied = r.log.commitIndex
 			}

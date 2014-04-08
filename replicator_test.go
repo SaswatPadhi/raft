@@ -75,6 +75,28 @@ func RaftStop(t *testing.T, replics []Replicator) {
 	}
 }
 
+func WaitTillLeaderElection(replics []Replicator, t *testing.T) Replicator {
+	var leader Replicator = nil
+	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
+
+	for i := 0; i <= max_iterations_to_monitor && leader == nil; i++ {
+		<-time.After(replics[0].HeartbeatInterval())
+
+		for _, replic := range replics {
+			if replic.State() == LEADER {
+				leader = replic
+				break
+			}
+		}
+	}
+
+	if leader == nil {
+		t.Fatalf("No leader found.")
+	}
+
+	return leader
+}
+
 /*========================================< TEST ROUTINES >========================================*/
 
 // TEST: Checks if a Raft cluster could be brought up and down successfully.
@@ -99,23 +121,7 @@ func Test_LeaderElectionInFiniteTime(t *testing.T) {
 	replics := RaftSetup(t, nil, true)
 	defer RaftStop(t, replics)
 
-	leader_found := false
-	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
-
-	for i := 0; i <= max_iterations_to_monitor && !leader_found; i++ {
-		<-time.After(replics[0].HeartbeatInterval())
-
-		for _, replic := range replics {
-			if replic.State() == LEADER {
-				leader_found = true
-				break
-			}
-		}
-	}
-
-	if !leader_found {
-		t.Fatalf("No leader found.")
-	}
+	WaitTillLeaderElection(replics, t)
 }
 
 // TEST: Leader election with minority failures
@@ -123,28 +129,11 @@ func Test_LeaderElectionWithMinorityFailures(t *testing.T) {
 	replics := RaftSetup(t, nil, false)
 	defer RaftStop(t, replics)
 
-	var i int
-	leader_found := false
-	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
-
-	for i = len(replics) / 2; i < len(replics); i++ {
+	for i := len(replics) / 2; i < len(replics); i++ {
 		replics[i].Start()
 	}
 
-	for i = 0; i <= max_iterations_to_monitor && !leader_found; i++ {
-		<-time.After(replics[0].HeartbeatInterval())
-
-		for _, replic := range replics {
-			if replic.State() == LEADER {
-				leader_found = true
-				break
-			}
-		}
-	}
-
-	if !leader_found {
-		t.Fatalf("No leader found.")
-	}
+	WaitTillLeaderElection(replics, t)
 }
 
 // TEST: Ensure only one leader exists
@@ -351,113 +340,72 @@ func (kvm *KVMachine) Apply(cmd interface{}) interface{} {
 	return resp
 }
 
+func validateReplicatorKVMachineResponse(seq int, req string, replic Replicator, replics []Replicator, timeout time.Duration, expected *KVMachineResp, t *testing.T) {
+	replic.Inbox() <- req
+	select {
+	case <-time.After(timeout):
+		t.Fatalf("Time out waiting for replicator's response!")
+
+	case resp := <-replic.Outbox():
+		if (expected == nil) == resp.raft_resp {
+			if resp.raft_resp {
+				t.Errorf("Non-leader responded [%s] to request [%s]!", resp, req)
+			} else {
+				t.Errorf("Leader ignored request!")
+			}
+		} else if expected != nil {
+			synced := 0
+			for _, replic := range replics {
+				if len(replic.(*replicator).log.entries) > seq && replic.(*replicator).log.entries[seq].Data.(string) == req {
+					synced++
+				}
+			}
+
+			if synced < (len(replics)+1)/2 {
+				t.Errorf("Log not replicated on majority, but request [%s] committed on leader!", req)
+			}
+
+			kvm_resp := resp.sm_resp.(*KVMachineResp)
+			if *kvm_resp != *expected {
+				t.Errorf("KVMachine's response [%s, %s] did not match expectation [%s, %s].", kvm_resp.status, kvm_resp.result, expected.status, expected.result)
+			}
+		}
+	}
+}
+
 func Test_KVMachine(t *testing.T) {
 	replics := RaftSetup(t, &KVMachine{dict: make(map[string]string)}, true)
 	defer RaftStop(t, replics)
 
-	var leader Replicator = nil
-	max_iterations_to_monitor := MAX_N2_ITERATIONS * len(replics) * len(replics)
-
-	for i := 0; i <= max_iterations_to_monitor && leader == nil; i++ {
-		<-time.After(replics[0].HeartbeatInterval())
-
-		for _, replic := range replics {
-			if replic.State() == LEADER {
-				leader = replic
-				break
-			}
-		}
+	leader := WaitTillLeaderElection(replics, t)
+	non_leader := replics[0]
+	if replics[0] == leader {
+		non_leader = replics[1]
 	}
 
-	if leader == nil {
-		t.Fatalf("No leader found.")
+	var timeout time.Duration = replics[0].HeartbeatInterval() * time.Duration(len(replics)*MAX_N2_ITERATIONS)
+
+	validateReplicatorKVMachineResponse(0, "SET Apple Fruit", leader, replics, timeout, &KVMachineResp{"good", ""}, t)
+	validateReplicatorKVMachineResponse(1, "SET Rose Flower", non_leader, replics, timeout, nil, t)
+	validateReplicatorKVMachineResponse(1, "SET Rose Flower", leader, replics, timeout, &KVMachineResp{"good", ""}, t)
+	validateReplicatorKVMachineResponse(2, "GET Apple", leader, replics, timeout, &KVMachineResp{"good", "Fruit"}, t)
+	validateReplicatorKVMachineResponse(3, "GET Rose", non_leader, replics, timeout, nil, t)
+	validateReplicatorKVMachineResponse(3, "GET Rose", leader, replics, timeout, &KVMachineResp{"good", "Flower"}, t)
+
+	active_partition := replics[0].(*replicator).server.Peers()[(len(replics)-1)/2:]
+	for j := 0; j < len(replics)/2; j++ {
+		replics[j].(*replicator).server.Blacklist(active_partition)
 	}
 
-	var req string
-	var resp ClientResponse
+	leader = WaitTillLeaderElection(replics, t)
+	validateReplicatorKVMachineResponse(4, "GET Apple", leader, replics, timeout, &KVMachineResp{"good", "Fruit"}, t)
+	validateReplicatorKVMachineResponse(5, "GET Rose", leader, replics, timeout, &KVMachineResp{"good", "Flower"}, t)
+	validateReplicatorKVMachineResponse(6, "SET Cow Animal", leader, replics, timeout, &KVMachineResp{"good", ""}, t)
+	validateReplicatorKVMachineResponse(7, "GET Cow", leader, replics, timeout, &KVMachineResp{"good", "Animal"}, t)
 
-	req = "SET Apple Fruit"
-	leader.Inbox() <- req
-	select {
-	case <-time.After(replics[0].HeartbeatInterval() * time.Duration(len(replics)*MAX_N2_ITERATIONS)):
-		t.Fatalf("Time out waiting for leader's response!")
-
-	case resp = <-leader.Outbox():
-		if !resp.raft_resp {
-			t.Errorf("Leader ignored request!")
-		} else {
-			synced := 0
-			for _, replic := range replics {
-				if len(replic.(*replicator).log.entries) > 0 && replic.(*replicator).log.entries[0].Data.(string) == req {
-					synced++
-				}
-			}
-
-			if synced < (len(replics)+1)/2 {
-				t.Errorf("Log not replicated on majority, but committed on leader!")
-			}
-
-			if resp.sm_resp.(*KVMachineResp).status != "good" {
-				t.Errorf("KVMachine did not return good on SET.")
-			}
-		}
+	for j := 0; j < len(replics)/2; j++ {
+		replics[j].(*replicator).server.Blacklist(nil)
 	}
-
-	req = "SET Rose Flower"
-	leader.Inbox() <- req
-	select {
-	case <-time.After(replics[0].HeartbeatInterval() * time.Duration(len(replics)*MAX_N2_ITERATIONS)):
-		t.Fatalf("Time out waiting for leader's response!")
-
-	case resp = <-leader.Outbox():
-		if !resp.raft_resp {
-			t.Errorf("Leader ignored request!")
-		} else {
-			synced := 0
-			for _, replic := range replics {
-				if len(replic.(*replicator).log.entries) > 1 && replic.(*replicator).log.entries[1].Data.(string) == req {
-					synced++
-				}
-			}
-
-			if synced < (len(replics)+1)/2 {
-				t.Errorf("Log not replicated on majority, but committed on leader!")
-			}
-
-			if resp.sm_resp.(*KVMachineResp).status != "good" {
-				t.Errorf("KVMachine did not return good on SET.")
-			}
-		}
-	}
-
-	req = "GET Apple"
-	leader.Inbox() <- req
-	select {
-	case <-time.After(replics[0].HeartbeatInterval() * time.Duration(len(replics)*MAX_N2_ITERATIONS)):
-		t.Fatalf("Time out waiting for leader's response!")
-
-	case resp = <-leader.Outbox():
-		if !resp.raft_resp {
-			t.Errorf("Leader ignored request!")
-		} else {
-			synced := 0
-			for _, replic := range replics {
-				if len(replic.(*replicator).log.entries) > 2 && replic.(*replicator).log.entries[2].Data.(string) == req {
-					synced++
-				}
-			}
-
-			if synced < (len(replics)+1)/2 {
-				t.Errorf("Log not replicated on majority, but committed on leader!")
-			}
-
-			if resp.sm_resp.(*KVMachineResp).status != "good" {
-				t.Errorf("KVMachine did not return good on GET.")
-			}
-
-			if resp.sm_resp.(*KVMachineResp).result != "Fruit" {
-				t.Errorf("KVMachine returned wrong value for key Apple.")
-			}
-		}
-	}
+	leader = WaitTillLeaderElection(replics, t)
+	validateReplicatorKVMachineResponse(8, "GET Cow", leader, replics, timeout, &KVMachineResp{"good", "Animal"}, t)
 }
