@@ -396,8 +396,8 @@ func Test_KVMachine(t *testing.T) {
 	for j := 0; j < len(replics)/2; j++ {
 		replics[j].(*replicator).server.Blacklist(active_partition)
 	}
-
 	leader = WaitTillLeaderElection(replics, t)
+
 	validateReplicatorKVMachineResponse(4, "GET Apple", leader, replics, timeout, &KVMachineResp{"good", "Fruit"}, t)
 	validateReplicatorKVMachineResponse(5, "GET Rose", leader, replics, timeout, &KVMachineResp{"good", "Flower"}, t)
 	validateReplicatorKVMachineResponse(6, "SET Cow Animal", leader, replics, timeout, &KVMachineResp{"good", ""}, t)
@@ -407,5 +407,6 @@ func Test_KVMachine(t *testing.T) {
 		replics[j].(*replicator).server.Blacklist(nil)
 	}
 	leader = WaitTillLeaderElection(replics, t)
+
 	validateReplicatorKVMachineResponse(8, "GET Cow", leader, replics, timeout, &KVMachineResp{"good", "Animal"}, t)
 }
