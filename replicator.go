@@ -8,6 +8,7 @@ import (
 
 	"bytes"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -68,6 +69,7 @@ type replicator struct {
 	internal_inbox     chan *raft_msg
 	internal_outbox    chan *raft_msg
 	leader             int
+	lock               *sync.RWMutex
 	log                *raft_log
 	outbox             chan ClientResponse
 	machine            StateMachine
@@ -95,6 +97,7 @@ func NewReplicator(id int, sm StateMachine, config_file string) (r *replicator, 
 		internal_inbox:     make(chan *raft_msg, 32),
 		internal_outbox:    make(chan *raft_msg, 32),
 		leader:             UNINITIALIZED,
+		lock:               &sync.RWMutex{},
 		log:                &raft_log{-1, -1, nil},
 		outbox:             make(chan ClientResponse, 32),
 		machine:            sm,
@@ -174,14 +177,24 @@ func (r *replicator) Start() (err error) {
 }
 
 func (r *replicator) State() int8 {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
 	return r.state
+}
+
+func (r *replicator) SetState(state int8) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	r.state = state
 }
 
 func (r *replicator) Stop() (err error) {
 	INFO.Println(fmt.Sprintf("Stopping replicator %d", r.server.Pid()))
 	defer INFO.Println(fmt.Sprintf("Replicator %d has fully stopped", r.server.Pid()))
 
-	if r.state != STOPPED && r.state != ERROR {
+	if r.State() != STOPPED && r.State() != ERROR {
 		r.stop <- true
 		r.stop <- true
 
@@ -249,7 +262,7 @@ func (r *replicator) serve() {
 	defer INFO.Println(fmt.Sprintf("Serve routine for replicator %d stopped", r.server.Pid()))
 
 	for {
-		switch r.state {
+		switch r.State() {
 		case CANDIDATE:
 			r.serveAsCandidate()
 		case FOLLOWER:
@@ -267,9 +280,9 @@ func (r *replicator) serveAsCandidate() {
 	INFO.Println(fmt.Sprintf("Replicator %d is now serving as CANDIDATE", r.server.Pid()))
 	defer INFO.Println(fmt.Sprintf("Replicator %d is no more a CANDIDATE", r.server.Pid()))
 
-	r.state = CANDIDATE
+	r.SetState(CANDIDATE)
 	r.leader = UNINITIALIZED
-	for r.state == CANDIDATE {
+	for r.State() == CANDIDATE {
 		// Increment the replicator's term & self-vote
 		r.term++
 		r.votes = 1
@@ -285,10 +298,10 @@ func (r *replicator) serveAsCandidate() {
 		}
 
 		timed_out := false
-		for !timed_out && r.state == CANDIDATE {
+		for !timed_out && r.State() == CANDIDATE {
 			// Become leader if have majority votes
 			if r.votes > len(r.server.Peers())/2 {
-				r.state = LEADER
+				r.SetState(LEADER)
 				break
 			}
 
@@ -313,8 +326,8 @@ func (r *replicator) serveAsFollower() {
 	INFO.Println(fmt.Sprintf("Replicator %d is now serving as FOLLOWER", r.server.Pid()))
 	defer INFO.Println(fmt.Sprintf("Replicator %d is no more a FOLLOWER", r.server.Pid()))
 
-	r.state = FOLLOWER
-	for r.state == FOLLOWER {
+	r.SetState(FOLLOWER)
+	for r.State() == FOLLOWER {
 		select {
 		case <-r.inbox:
 			r.outbox <- ClientResponse{
@@ -326,7 +339,7 @@ func (r *replicator) serveAsFollower() {
 			r.handleRaftMessage(msg)
 
 		case <-time.After(r.election_timeout):
-			r.state = CANDIDATE
+			r.SetState(CANDIDATE)
 		}
 	}
 }
@@ -335,7 +348,7 @@ func (r *replicator) serveAsLeader() {
 	INFO.Println(fmt.Sprintf("Replicator %d is now serving as LEADER", r.server.Pid()))
 	defer INFO.Println(fmt.Sprintf("Replicator %d is no more a LEADER", r.server.Pid()))
 
-	r.state = LEADER
+	r.SetState(LEADER)
 	r.leader = r.server.Pid()
 	r.nextIndex = make(map[int]int)
 	r.matchIndex = make(map[int]int)
@@ -347,7 +360,7 @@ func (r *replicator) serveAsLeader() {
 
 	r.broadcastAppendEntries()
 
-	for r.state == LEADER {
+	for r.State() == LEADER {
 		select {
 		case cmd := <-r.inbox:
 			r.handleStateMachineCommand(cmd)
@@ -364,7 +377,7 @@ func (r *replicator) serveAsLeader() {
 /*========================================< LEADER HELPERS >=========================================*/
 
 func (r *replicator) broadcastAppendEntries() {
-	if r.state == LEADER {
+	if r.State() == LEADER {
 		INFO.Println(fmt.Sprintf("Replicator %d is now sending AEs.", r.server.Pid()))
 		defer INFO.Println(fmt.Sprintf("Replicator %d has sent AEs.", r.server.Pid()))
 
@@ -385,7 +398,7 @@ func (r *replicator) broadcastAppendEntries() {
 }
 
 func (r *replicator) handleStateMachineCommand(cmd interface{}) {
-	if r.state == LEADER {
+	if r.State() == LEADER {
 		r.log.createAndAddNewEntry(cmd, r.term)
 
 		if len(r.server.Peers()) == 0 {
@@ -407,8 +420,8 @@ func (r *replicator) handleRaftMessage(msg *raft_msg) {
 	if msg.Term > r.term {
 		r.term = msg.Term
 		r.voted_for = UNINITIALIZED
-		if r.state != FOLLOWER {
-			r.state = FOLLOWER
+		if r.State() != FOLLOWER {
+			r.SetState(FOLLOWER)
 			r.leader = UNINITIALIZED
 		}
 	}
@@ -420,14 +433,14 @@ func (r *replicator) handleRaftMessage(msg *raft_msg) {
 	case REQUEST_VOTE:
 		r.handleRequestVote(msg)
 	case REQUEST_VOTE_RESP:
-		if r.state == CANDIDATE && msg.Result == true {
+		if r.State() == CANDIDATE && msg.Result == true {
 			r.votes++
 		}
 
 	case APPEND_ENTRIES:
 		r.handleAppendEntries(msg)
 	case APPEND_ENTRIES_RESP:
-		if r.state == LEADER {
+		if r.State() == LEADER {
 			if msg.Result == true {
 				r.matchIndex[msg.Addr] = msg.PrevLogIndex
 				r.nextIndex[msg.Addr] = r.matchIndex[msg.Addr] + 1
@@ -466,7 +479,7 @@ func (r *replicator) handleTerminate(msg *raft_msg) {
 	INFO.Println(fmt.Sprintf("Replicator %d has received a TERMINATE request.", r.server.Pid()))
 	defer INFO.Println(fmt.Sprintf("Replicator %d is now STOPPED.", r.server.Pid()))
 
-	r.state = STOPPED
+	r.SetState(STOPPED)
 	if msg.Addr != r.server.Pid() {
 		EROR.Println("TERMINATE RPC received from another server! ABORTING")
 	}

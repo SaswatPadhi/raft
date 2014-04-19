@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -300,7 +301,8 @@ func Test_LeaderElectionWithMajorityFailures(t *testing.T) {
 
 /*=======================================< KV STORE >=======================================*/
 
-type KVMachine struct {
+type kvMachine struct {
+	lock *sync.RWMutex
 	dict map[string]string
 }
 
@@ -309,7 +311,14 @@ type KVMachineResp struct {
 	result string
 }
 
-func (kvm *KVMachine) Apply(cmd interface{}) interface{} {
+func NewKVMachine() (kvm *kvMachine) {
+	return &kvMachine{
+		lock: &sync.RWMutex{},
+		dict: make(map[string]string),
+	}
+}
+
+func (kvm *kvMachine) Apply(cmd interface{}) interface{} {
 	resp := &KVMachineResp{
 		status: "error",
 		result: "",
@@ -321,7 +330,10 @@ func (kvm *KVMachine) Apply(cmd interface{}) interface{} {
 		switch parts[0] {
 		case "GET":
 			if len(parts) > 1 {
+				kvm.lock.RLock()
 				val, found := kvm.dict[parts[1]]
+				kvm.lock.RUnlock()
+
 				if found {
 					resp.status = "good"
 					resp.result = val
@@ -331,7 +343,9 @@ func (kvm *KVMachine) Apply(cmd interface{}) interface{} {
 			}
 		case "SET":
 			if len(parts) > 2 {
+				kvm.lock.Lock()
 				kvm.dict[parts[1]] = parts[2]
+				kvm.lock.Unlock()
 				resp.status = "good"
 			}
 		}
@@ -344,7 +358,7 @@ func validateReplicatorKVMachineResponse(seq int, req string, replic Replicator,
 	replic.Inbox() <- req
 	select {
 	case <-time.After(timeout):
-		t.Fatalf("Time out waiting for replicator's response!")
+		t.Fatalf("Time out waiting for replicator's response on [%s]!", req)
 
 	case resp := <-replic.Outbox():
 		if (expected == nil) == resp.raft_resp {
@@ -374,7 +388,7 @@ func validateReplicatorKVMachineResponse(seq int, req string, replic Replicator,
 }
 
 func Test_KVMachine(t *testing.T) {
-	replics := RaftSetup(t, &KVMachine{dict: make(map[string]string)}, true)
+	replics := RaftSetup(t, NewKVMachine(), true)
 	defer RaftStop(t, replics)
 
 	leader := WaitTillLeaderElection(replics, t)
@@ -383,7 +397,7 @@ func Test_KVMachine(t *testing.T) {
 		non_leader = replics[1]
 	}
 
-	var timeout time.Duration = replics[0].HeartbeatInterval() * time.Duration(len(replics)*MAX_N2_ITERATIONS)
+	var timeout time.Duration = replics[0].HeartbeatInterval() * time.Duration(len(replics)*len(replics)*MAX_N2_ITERATIONS)
 
 	validateReplicatorKVMachineResponse(0, "SET Apple Fruit", leader, replics, timeout, &KVMachineResp{"good", ""}, t)
 	validateReplicatorKVMachineResponse(1, "SET Rose Flower", non_leader, replics, timeout, nil, t)
@@ -409,4 +423,5 @@ func Test_KVMachine(t *testing.T) {
 	leader = WaitTillLeaderElection(replics, t)
 
 	validateReplicatorKVMachineResponse(8, "GET Cow", leader, replics, timeout, &KVMachineResp{"good", "Animal"}, t)
+	validateReplicatorKVMachineResponse(9, "GET Rose", leader, replics, timeout, &KVMachineResp{"good", "Flower"}, t)
 }
